@@ -6,7 +6,7 @@ const router = Router()
 
 // POST /auth/register
 router.post('/register', async (req, res) => {
-  const { name, email, password, role = 'creator' } = req.body
+  const { name, email, password, role = 'respondent' } = req.body
   if (!name || !email || !password) {
     return res.status(400).json({ code: 'VALIDATION_ERROR', message: 'name, email y password son requeridos' })
   }
