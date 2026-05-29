@@ -2,8 +2,117 @@ import { Router } from 'express'
 import { nanoid } from 'nanoid'
 import supabase from '../db/supabase.js'
 import { authenticate } from '../middleware/auth.js'
+import { generatePDF, generateExcel } from '../utils/reportGenerator.js'
 
 const router = Router()
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Verifica que el usuario sea dueño de la encuesta o admin. */
+async function checkOwnership(surveyId, user) {
+  const { data, error } = await supabase
+    .from('surveys').select('id, created_by').eq('id', surveyId).single()
+  if (error || !data) return { allowed: false, notFound: true }
+  if (user.role !== 'admin' && data.created_by !== user.id) return { allowed: false, notFound: false }
+  return { allowed: true, survey: data }
+}
+
+/** Construye el objeto de reporte a partir de los datos crudos de la BD. */
+function buildReport(survey, responses, questions, totalAssigned) {
+  const completed      = responses.filter(r => r.is_complete)
+  const totalResponses = responses.length
+  const completionRate = totalAssigned ? (completed.length / totalAssigned) * 100 : 0
+
+  const byDay = {}
+  responses.forEach(r => {
+    const day = r.started_at?.split('T')[0]
+    if (day) byDay[day] = (byDay[day] || 0) + 1
+  })
+
+  const allAnswers = responses.flatMap(r => r.answers || [])
+  const questions_summary = questions.map(q => {
+    const qAnswers = allAnswers.filter(a => a.question_id === q.id)
+    const stats = {
+      question_id: q.id, question_text: q.text, question_type: q.type,
+      response_count: qAnswers.length, skip_count: totalResponses - qAnswers.length
+    }
+
+    if (['multiple_choice', 'single_choice', 'checkbox'].includes(q.type) && q.options) {
+      const optionCounts = {}
+      qAnswers.forEach(a => {
+        const vals = Array.isArray(a.value) ? a.value : [a.value]
+        vals.forEach(v => { optionCounts[v] = (optionCounts[v] || 0) + 1 })
+      })
+      stats.option_stats = (q.options || []).map(opt => ({
+        option_id: opt.id || opt.value, option_text: opt.text,
+        count: optionCounts[opt.value] || 0,
+        percentage: qAnswers.length
+          ? ((optionCounts[opt.value] || 0) / qAnswers.length) * 100
+          : 0
+      }))
+    }
+
+    if (['scale', 'rating'].includes(q.type)) {
+      const nums = qAnswers.map(a => Number(a.value)).filter(n => !isNaN(n))
+      if (nums.length) {
+        const sorted = [...nums].sort((a, b) => a - b)
+        const mean   = nums.reduce((s, n) => s + n, 0) / nums.length
+        const median = sorted.length % 2 === 0
+          ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+          : sorted[Math.floor(sorted.length / 2)]
+        const std_deviation = Math.sqrt(
+          nums.reduce((s, n) => s + Math.pow(n - mean, 2), 0) / nums.length
+        )
+        stats.numeric_stats = {
+          min: Math.min(...nums), max: Math.max(...nums),
+          mean: Math.round(mean * 100) / 100, median,
+          std_deviation: Math.round(std_deviation * 100) / 100
+        }
+      }
+    }
+
+    if (q.type === 'open_text') {
+      stats.open_answers = qAnswers.slice(0, 50).map(a => a.value)
+    }
+
+    return stats
+  })
+
+  const avgDuration = completed.length
+    ? completed.reduce((s, r) => s + (r.duration_seconds || 0), 0) / completed.length
+    : 0
+
+  return {
+    survey_id: survey.id, survey_title: survey.title,
+    total_assigned: totalAssigned, total_responses: totalResponses,
+    completion_rate: Math.round(completionRate * 10) / 10,
+    avg_duration_seconds: Math.round(avgDuration),
+    first_response_at: responses[responses.length - 1]?.started_at || null,
+    last_response_at:  responses[0]?.started_at || null,
+    responses_by_day:  Object.entries(byDay).map(([date, count]) => ({ date, count })),
+    questions_summary
+  }
+}
+
+/** Carga todos los datos necesarios para construir un reporte. */
+async function fetchReportData(surveyId) {
+  const [
+    { data: survey },
+    { data: responses },
+    { data: questions },
+    { count: totalAssigned }
+  ] = await Promise.all([
+    supabase.from('surveys').select('id, title, created_by').eq('id', surveyId).single(),
+    supabase.from('responses').select('*, answers(*)').eq('survey_id', surveyId).order('started_at', { ascending: false }),
+    supabase.from('questions').select('*').eq('survey_id', surveyId).order('order'),
+    supabase.from('assignments').select('*', { count: 'exact' }).eq('survey_id', surveyId)
+  ])
+  return { survey, responses: responses || [], questions: questions || [], totalAssigned: totalAssigned || 0 }
+}
+
+// ── SURVEYS ───────────────────────────────────────────────────────────────────
 
 // GET /surveys
 router.get('/', authenticate, async (req, res) => {
@@ -16,10 +125,9 @@ router.get('/', authenticate, async (req, res) => {
     .order('created_at', { ascending: false })
     .range(offset, offset + Number(limit) - 1)
 
-  
   if (req.user.role !== 'admin') query = query.eq('created_by', req.user.id)
   if (status) query = query.eq('status', status)
-  if (type) query = query.eq('type', type)
+  if (type)   query = query.eq('type', type)
   if (created_by && req.user.role === 'admin') query = query.eq('created_by', created_by)
 
   const { data, error, count } = await query
@@ -53,28 +161,24 @@ router.post('/', authenticate, async (req, res) => {
 })
 
 // GET /surveys/:surveyId
+// FIX: valida ownership ANTES de devolver datos completos para evitar fuga de información
 router.get('/:surveyId', authenticate, async (req, res) => {
-  const { data, error } = await supabase
-    .from('surveys')
-    .select('*, questions(*)')
-    .eq('id', req.params.surveyId)
-    .single()
+  const { allowed, notFound } = await checkOwnership(req.params.surveyId, req.user)
+  if (notFound) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (!allowed) return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
 
+  const { data, error } = await supabase
+    .from('surveys').select('*, questions(*)').eq('id', req.params.surveyId).single()
   if (error || !data) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
-  if (req.user.role !== 'admin' && data.created_by !== req.user.id) {
-    return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
-  }
   res.json(data)
 })
 
 // PUT /surveys/:surveyId
 router.put('/:surveyId', authenticate, async (req, res) => {
   const { title, description, type, settings } = req.body
-  const { data: existing } = await supabase.from('surveys').select('created_by').eq('id', req.params.surveyId).single()
-  if (!existing) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
-  if (req.user.role !== 'admin' && existing.created_by !== req.user.id) {
-    return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
-  }
+  const { allowed, notFound } = await checkOwnership(req.params.surveyId, req.user)
+  if (notFound) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (!allowed) return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
 
   const { data, error } = await supabase.from('surveys')
     .update({ title, description, type, settings, updated_at: new Date().toISOString() })
@@ -87,18 +191,16 @@ router.put('/:surveyId', authenticate, async (req, res) => {
 
 // DELETE /surveys/:surveyId
 router.delete('/:surveyId', authenticate, async (req, res) => {
-  const { data: existing } = await supabase.from('surveys').select('created_by').eq('id', req.params.surveyId).single()
-  if (!existing) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
-  if (req.user.role !== 'admin' && existing.created_by !== req.user.id) {
-    return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
-  }
+  const { allowed, notFound } = await checkOwnership(req.params.surveyId, req.user)
+  if (notFound) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (!allowed) return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
+
   await supabase.from('surveys').delete().eq('id', req.params.surveyId)
   res.status(204).send()
 })
 
 // POST /surveys/:surveyId/publish
 router.post('/:surveyId/publish', authenticate, async (req, res) => {
-  // Reuse existing token if survey was already published, otherwise generate new one
   const { data: existing } = await supabase.from('surveys')
     .select('public_token, created_by').eq('id', req.params.surveyId).single()
   if (!existing) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
@@ -117,36 +219,48 @@ router.post('/:surveyId/publish', authenticate, async (req, res) => {
 })
 
 // POST /surveys/:surveyId/close
+// FIX: agregada verificación de ownership (antes cualquier usuario podía cerrar encuestas ajenas)
 router.post('/:surveyId/close', authenticate, async (req, res) => {
+  const { allowed, notFound } = await checkOwnership(req.params.surveyId, req.user)
+  if (notFound) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (!allowed) return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
+
   const { data, error } = await supabase.from('surveys')
     .update({ status: 'closed', updated_at: new Date().toISOString() })
     .eq('id', req.params.surveyId)
     .select().single()
 
-  if (error || !data) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (error || !data) return res.status(500).json({ code: 'DB_ERROR', message: error?.message })
   res.json(data)
 })
 
 // POST /surveys/:surveyId/duplicate
+// FIX: manejo de error si el insert de la copia falla
 router.post('/:surveyId/duplicate', authenticate, async (req, res) => {
   const { data: original } = await supabase.from('surveys')
     .select('*, questions(*)').eq('id', req.params.surveyId).single()
   if (!original) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
 
-  const { data: copy } = await supabase.from('surveys').insert({
+  const { data: copy, error: copyError } = await supabase.from('surveys').insert({
     title: `${original.title} (copia)`, description: original.description,
     type: original.type, settings: original.settings,
     created_by: req.user.id, status: 'draft'
   }).select().single()
 
+  if (copyError || !copy) {
+    return res.status(500).json({ code: 'DB_ERROR', message: copyError?.message || 'Error al duplicar' })
+  }
+
   if (original.questions?.length) {
-    const questionsCopy = original.questions.map(q => ({ ...q, id: undefined, survey_id: copy.id, created_at: undefined }))
+    const questionsCopy = original.questions.map(({ id: _id, created_at: _ca, ...q }) => ({
+      ...q, survey_id: copy.id
+    }))
     await supabase.from('questions').insert(questionsCopy)
   }
   res.status(201).json(copy)
 })
 
-// ── QUESTIONS ──────────────────────────────────
+// ── QUESTIONS ─────────────────────────────────────────────────────────────────
 
 // GET /surveys/:surveyId/questions
 router.get('/:surveyId/questions', authenticate, async (req, res) => {
@@ -189,18 +303,22 @@ router.delete('/:surveyId/questions/:questionId', authenticate, async (req, res)
 })
 
 // PATCH /surveys/:surveyId/questions/reorder
+// MEJORA: upsert batch en lugar de N queries individuales
 router.patch('/:surveyId/questions/reorder', authenticate, async (req, res) => {
   const { order } = req.body
-  if (!Array.isArray(order)) return res.status(400).json({ code: 'VALIDATION_ERROR', message: 'order debe ser un array de IDs' })
+  if (!Array.isArray(order)) {
+    return res.status(400).json({ code: 'VALIDATION_ERROR', message: 'order debe ser un array de IDs' })
+  }
 
-  const updates = order.map((id, index) =>
-    supabase.from('questions').update({ order: index + 1 }).eq('id', id).eq('survey_id', req.params.surveyId)
-  )
-  await Promise.all(updates)
+  const rows = order.map((id, index) => ({ id, order: index + 1, survey_id: req.params.surveyId }))
+  const { error } = await supabase.from('questions')
+    .upsert(rows, { onConflict: 'id' })
+
+  if (error) return res.status(500).json({ code: 'DB_ERROR', message: error.message })
   res.json({ message: 'Orden actualizado' })
 })
 
-
+// ── ASSIGNMENTS ───────────────────────────────────────────────────────────────
 
 // GET /surveys/:surveyId/assignments
 router.get('/:surveyId/assignments', authenticate, async (req, res) => {
@@ -234,7 +352,7 @@ router.delete('/:surveyId/assignments/:assignmentId', authenticate, async (req, 
   res.status(204).send()
 })
 
-// ── RESPONSES ──────────────────────────────────
+// ── RESPONSES ─────────────────────────────────────────────────────────────────
 
 // GET /surveys/:surveyId/responses
 router.get('/:surveyId/responses', authenticate, async (req, res) => {
@@ -246,86 +364,56 @@ router.get('/:surveyId/responses', authenticate, async (req, res) => {
 })
 
 // GET /surveys/:surveyId/reports
+// FIX: agregada verificación de ownership
 router.get('/:surveyId/reports', authenticate, async (req, res) => {
-  const { data: survey } = await supabase.from('surveys')
-    .select('id, title').eq('id', req.params.surveyId).single()
+  const { survey, responses, questions, totalAssigned } = await fetchReportData(req.params.surveyId)
   if (!survey) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (req.user.role !== 'admin' && survey.created_by !== req.user.id) {
+    return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
+  }
+  res.json(buildReport(survey, responses, questions, totalAssigned))
+})
 
-  const [{ data: responses }, { data: questions }] = await Promise.all([
-    supabase.from('responses').select('*, answers(*)').eq('survey_id', req.params.surveyId),
-    supabase.from('questions').select('*').eq('survey_id', req.params.surveyId).order('order')
-  ])
+// ── EXPORTS ───────────────────────────────────────────────────────────────────
 
-  const completed = (responses || []).filter(r => r.is_complete)
-  const totalResponses = (responses || []).length
+// GET /surveys/:surveyId/export/pdf
+// FIX: try/catch para errores durante el stream del PDF
+router.get('/:surveyId/export/pdf', authenticate, async (req, res) => {
+  const { survey, responses, questions, totalAssigned } = await fetchReportData(req.params.surveyId)
+  if (!survey) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (req.user.role !== 'admin' && survey.created_by !== req.user.id) {
+    return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
+  }
 
-  // Responses by day
-  const byDay = {}
-  responses.forEach(r => {
-    const day = r.started_at?.split('T')[0]
-    if (day) byDay[day] = (byDay[day] || 0) + 1
-  })
-
-  // Per-question stats
-  const allAnswers = responses.flatMap(r => r.answers || [])
-  const questions_summary = questions.map(q => {
-    const qAnswers = allAnswers.filter(a => a.question_id === q.id)
-    const stats = { question_id: q.id, question_text: q.text, question_type: q.type, response_count: qAnswers.length, skip_count: totalResponses - qAnswers.length }
-
-    if (['multiple_choice', 'single_choice', 'checkbox'].includes(q.type) && q.options) {
-      const optionCounts = {}
-      qAnswers.forEach(a => {
-        const vals = Array.isArray(a.value) ? a.value : [a.value]
-        vals.forEach(v => { optionCounts[v] = (optionCounts[v] || 0) + 1 })
-      })
-      stats.option_stats = (q.options || []).map(opt => ({
-        option_id: opt.id || opt.value,
-        option_text: opt.text,
-        count: optionCounts[opt.value] || 0,
-        percentage: qAnswers.length ? ((optionCounts[opt.value] || 0) / qAnswers.length) * 100 : 0
-      }))
+  try {
+    const report = buildReport(survey, responses, questions, totalAssigned)
+    generatePDF(report, res)
+  } catch (err) {
+    console.error('Error generando PDF:', err)
+    if (!res.headersSent) {
+      res.status(500).json({ code: 'EXPORT_ERROR', message: 'Error al generar el PDF' })
     }
-    if (['scale', 'rating'].includes(q.type)) {
-      const nums = qAnswers.map(a => Number(a.value)).filter(n => !isNaN(n))
-      if (nums.length) {
-        const sorted = [...nums].sort((a, b) => a - b)
-        const mean = nums.reduce((s, n) => s + n, 0) / nums.length
-        const median = sorted.length % 2 === 0
-          ? (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
-          : sorted[Math.floor(sorted.length / 2)]
-        const std_deviation = Math.sqrt(
-          nums.reduce((s, n) => s + Math.pow(n - mean, 2), 0) / nums.length
-        )
-        stats.numeric_stats = {
-          min: Math.min(...nums),
-          max: Math.max(...nums),
-          mean: Math.round(mean * 100) / 100,
-          median,
-          std_deviation: Math.round(std_deviation * 100) / 100
-        }
-      }
-    }
-    if (q.type === 'open_text') {
-      stats.open_answers = qAnswers.slice(0, 20).map(a => a.value)
-    }
-    return stats
-  })
+  }
+})
 
-  const avgDuration = completed.length
-    ? completed.reduce((s, r) => s + (r.duration_seconds || 0), 0) / completed.length
-    : 0
+// GET /surveys/:surveyId/export/excel
+// FIX: try/catch para errores durante el stream del Excel
+router.get('/:surveyId/export/excel', authenticate, async (req, res) => {
+  const { survey, responses, questions, totalAssigned } = await fetchReportData(req.params.surveyId)
+  if (!survey) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
+  if (req.user.role !== 'admin' && survey.created_by !== req.user.id) {
+    return res.status(403).json({ code: 'FORBIDDEN', message: 'Sin acceso' })
+  }
 
-  res.json({
-    survey_id: survey.id, survey_title: survey.title,
-    total_responses: totalResponses,
-    complete_responses: completed.length,
-    total_questions: (questions || []).length,
-    avg_duration_seconds: Math.round(avgDuration),
-    first_response_at: (responses || [])[responses.length - 1]?.started_at || null,
-    last_response_at: (responses || [])[0]?.started_at || null,
-    responses_by_day: Object.entries(byDay).map(([date, count]) => ({ date, count })),
-    questions_summary
-  })
+  try {
+    const report = buildReport(survey, responses, questions, totalAssigned)
+    await generateExcel(report, res)
+  } catch (err) {
+    console.error('Error generando Excel:', err)
+    if (!res.headersSent) {
+      res.status(500).json({ code: 'EXPORT_ERROR', message: 'Error al generar el Excel' })
+    }
+  }
 })
 
 export default router
