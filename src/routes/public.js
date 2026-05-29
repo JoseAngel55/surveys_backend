@@ -52,6 +52,15 @@ router.post('/surveys/:token/respond', async (req, res) => {
   if (!survey) return res.status(404).json({ code: 'NOT_FOUND', message: 'Encuesta no encontrada' })
   if (survey.status !== 'active') return res.status(400).json({ code: 'SURVEY_CLOSED', message: 'Esta encuesta ya no está activa' })
 
+  // Validate time limit if configured
+  const timeLimit = survey.settings?.time_limit_minutes
+  if (timeLimit && started_at) {
+    const elapsed = (new Date() - new Date(started_at)) / 1000 / 60
+    if (elapsed > timeLimit) {
+      return res.status(400).json({ code: 'TIME_EXPIRED', message: 'El tiempo límite de la encuesta ha expirado' })
+    }
+  }
+
   const completedAt = new Date()
   // Use started_at sent from frontend (when user first opened the survey)
   // Fallback: 0 duration if not provided
