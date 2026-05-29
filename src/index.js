@@ -7,6 +7,7 @@ import userRoutes from './routes/users.js'
 import groupRoutes from './routes/groups.js'
 import surveyRoutes from './routes/surveys.js'
 import publicRoutes from './routes/public.js'
+import publicAssignmentRoutes from './routes/public_assignments.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
@@ -23,6 +24,7 @@ app.use('/users', userRoutes)
 app.use('/groups', groupRoutes)
 app.use('/surveys', surveyRoutes)
 app.use('/public', publicRoutes)
+app.use('/public/a', publicAssignmentRoutes)
 
 // Health check
 app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }))
